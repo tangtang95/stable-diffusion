@@ -6,7 +6,7 @@ from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm, trange
 from itertools import islice
-from einops import rearrange
+from einops import rearrange, repeat
 from torchvision.utils import make_grid
 import time
 from pytorch_lightning import seed_everything
@@ -18,6 +18,36 @@ from transformers import logging
 import pandas as pd
 logging.set_verbosity_error()
 
+def preprocess_image(image):
+    w, h = image.size
+    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+    image = image.resize((w, h), resample=Image.LANCZOS)
+    image = np.array(image).astype(np.float32) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    return 2.0 * image - 1.0
+
+def preprocess_mask(mask):
+    mask = mask.convert("L")
+    w, h = mask.size
+    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+    mask = mask.resize((w // 8, h // 8), resample=Image.NEAREST)
+    mask = np.array(mask).astype(np.float32) / 255.0
+    mask = np.tile(mask, (4, 1, 1))
+    mask = mask[None].transpose(0, 1, 2, 3)  # what does this step do?
+    mask = 1 - mask  # repaint white, keep black
+    mask = torch.from_numpy(mask)
+    return mask
+
+def img_callback(x0, i):
+    modelFS.to('cuda')
+    x_samples_ddim = modelFS.decode_first_stage(x0[0].unsqueeze(0))
+    x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+    x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
+    Image.fromarray(x_sample.astype(np.uint8)).save(
+        os.path.join(sample_path + "/samples", "seed_" + str(opt.seed) + "_index" + str(i) + "_" + f"{base_count:05}.{opt.format}")
+    )
+    modelFS.to('cpu')
 
 def chunk(it, size):
     it = iter(it)
@@ -31,16 +61,6 @@ def load_model_from_config(ckpt, verbose=False):
         print(f"Global Step: {pl_sd['global_step']}")
     sd = pl_sd["state_dict"]
     return sd
-
-def img_callback(x0, i):
-    modelFS.to('cuda')
-    x_samples_ddim = modelFS.decode_first_stage(x0[0].unsqueeze(0))
-    x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-    x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
-    Image.fromarray(x_sample.astype(np.uint8)).save(
-        os.path.join(sample_path + "/samples", "seed_" + str(opt.seed) + "_index" + str(i) + "_" + f"{base_count:05}.{opt.format}")
-    )
-    modelFS.to('cpu')
 
 
 config = "optimizedSD/v1-inference.yaml"
@@ -170,6 +190,18 @@ parser.add_argument(
     choices=["jpg", "png"],
     default="png",
 )
+parser.add_argument(
+    "--image_prompt",
+    type=str,
+    help="image to prompt with, must specify a mask",
+    default=None
+)
+parser.add_argument(
+    "--mask_prompt",
+    type=str,
+    help="mask to prompt with, must specify image prompt",
+    default=None
+)
 opt = parser.parse_args()
 
 tic = time.time()
@@ -177,12 +209,12 @@ os.makedirs(opt.outdir, exist_ok=True)
 outpath = opt.outdir
 grid_count = len(os.listdir(outpath)) - 1
 
-if opt.seed == None:
+if opt.seed is None:
     opt.seed = randint(0, 1000000)
 seed_everything(opt.seed)
 
 # Logging
-logger(vars(opt), log_csv = "logs/txt2img_logs.csv")
+logger(vars(opt), log_csv="logs/txt2img_logs.csv")
 
 sd = load_model_from_config(f"{ckpt}")
 li, lo = [], []
@@ -219,6 +251,7 @@ modelCS.cond_stage_model.device = opt.device
 modelFS = instantiate_from_config(config.modelFirstStage)
 _, _ = modelFS.load_state_dict(sd, strict=False)
 modelFS.eval()
+model.set_first_stage_model(modelFS)
 del sd
 
 if opt.device != "cpu" and opt.precision == "autocast":
@@ -244,6 +277,26 @@ else:
         data = batch_size * list(data)
         data = list(chunk(sorted(data), batch_size))
 
+image_prompt = opt.image_prompt
+mask_prompt = opt.mask_prompt
+
+# by default not do inpaint
+x0 = None
+mask = None
+
+# inpaint
+if image_prompt and mask_prompt:
+    modelFS.to(opt.device)
+    print("Using image as x0: " + image_prompt)
+    print("Using mask image: " + mask_prompt)
+    image_prompt_input = preprocess_image(Image.open(image_prompt))
+    image_prompt_input = repeat(image_prompt_input[0, :, :, :], 'c h w -> b c h w', b=opt.n_samples).to(opt.device)
+    encoder_posterior = modelFS.encode_first_stage(image_prompt_input)
+    x0 = modelFS.get_first_stage_encoding(encoder_posterior).detach().to(opt.device)
+    mask = preprocess_mask(Image.open(mask_prompt))
+    mask = repeat(mask[0, :, :, :], 'c h w -> b c h w', b=opt.n_samples).to(opt.device)
+    if opt.device != "cpu":
+        modelFS.to("cpu")
 
 if opt.precision == "autocast" and opt.device != "cpu":
     precision_scope = autocast
@@ -300,8 +353,11 @@ with torch.no_grad():
                     verbose=False,
                     unconditional_guidance_scale=opt.scale,
                     unconditional_conditioning=uc,
+                    quantize_x0=False,
                     eta=opt.ddim_eta,
                     x_T=start_code,
+                    mask=mask,
+                    x0=x0,
                     img_callback=img_callback
                 )
 

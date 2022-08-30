@@ -100,11 +100,14 @@ class DDPM(pl.LightningModule):
         self.linear_end = linear_end
         assert alphas_cumprod.shape[0] == self.num_timesteps, 'alphas have to be defined for each timestep'
 
-        to_torch = partial(torch.tensor, dtype=torch.float32)
+        to_torch = partial(torch.tensor, dtype=torch.float32, device='cuda')
 
         self.register_buffer('betas', to_torch(betas))
         self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
         self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))
+
+        # self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
+        # self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod)))
 
 
 class FirstStage(DDPM):
@@ -371,6 +374,9 @@ class UNet(DDPM):
             self.init_from_ckpt(ckpt_path, ignore_keys)
             self.restarted_from_ckpt = True
 
+    def set_first_stage_model(self, first_stage_model):
+        self.first_stage_model = first_stage_model
+
     def make_cond_schedule(self, ):
         self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
         ids = torch.round(torch.linspace(0, self.num_timesteps - 1, self.num_timesteps_cond)).long()
@@ -393,6 +399,28 @@ class UNet(DDPM):
             print(f"setting self.scale_factor to {self.scale_factor}")
             print("### USING STD-RESCALING ###")
 
+
+    def q_sample(self, x_start, t, index, seed=None, use_original_steps=False, noise=None):
+        if use_original_steps:
+            sqrt_alphas_cumprod = self.sqrt_alphas_cumprod
+            sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod
+        else:
+            sqrt_alphas_cumprod = torch.sqrt(self.ddim_alphas)
+            sqrt_one_minus_alphas_cumprod = self.ddim_sqrt_one_minus_alphas
+
+        if noise is None:
+            b0, b1, b2, b3 = x_start.shape
+            img_shape = (1, b1, b2, b3)
+            tens = []
+            for _ in range(b0):
+                torch.manual_seed(seed)
+                tens.append(torch.randn(img_shape, device=x_start.device))
+                seed += 1
+            noise = torch.cat(tens)
+            del tens
+        sqrt_alpha = torch.full((x_start.shape[0], 1, 1, 1), sqrt_alphas_cumprod[index], device=self.cdevice)
+        sqrt_one_minus_alpha = torch.full((x_start.shape[0], 1, 1, 1), sqrt_one_minus_alphas_cumprod[index], device=self.cdevice)
+        return (sqrt_alpha * x_start + sqrt_one_minus_alpha * noise)
 
     def apply_model(self, x_noisy, t, cond, return_ids=False):
           
@@ -463,7 +491,6 @@ class UNet(DDPM):
         self.register_buffer1('ddim_alphas', ddim_alphas)
         self.register_buffer1('ddim_alphas_prev', ddim_alphas_prev)
         self.register_buffer1('ddim_sqrt_one_minus_alphas', np.sqrt(1. - ddim_alphas))
-        self.ddim_sqrt_one_minus_alphas = np.sqrt(1. - ddim_alphas)
         sigmas_for_original_sampling_steps = ddim_eta * torch.sqrt(
             (1 - self.alphas_cumprod_prev) / (1 - self.alphas_cumprod) * (
                         1 - self.alphas_cumprod / self.alphas_cumprod_prev))
@@ -575,11 +602,6 @@ class UNet(DDPM):
             ts = torch.full((b,), step, device=device, dtype=torch.long)
             ts_next = torch.full((b,), time_range[min(i + 1, len(time_range) - 1)], device=device, dtype=torch.long)
 
-            if mask is not None:
-                assert x0 is not None
-                img_orig = self.q_sample(x0, ts)  # TODO: deterministic forward pass?
-                img = img_orig * mask + (1. - mask) * img
-
             outs = self.p_sample_plms(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
                                       quantize_denoised=quantize_denoised, temperature=temperature,
                                       noise_dropout=noise_dropout, score_corrector=score_corrector,
@@ -588,6 +610,11 @@ class UNet(DDPM):
                                       unconditional_conditioning=unconditional_conditioning,
                                       old_eps=old_eps, t_next=ts_next)
             img, pred_x0, e_t = outs
+            
+            if mask is not None and x0 is not None:
+                img_orig = self.q_sample(x0, ts, seed, use_original_steps=ddim_use_original_steps)
+                img = img_orig * (1. - mask) + mask * img
+            
             old_eps.append(e_t)
             if len(old_eps) >= 4:
                 old_eps.pop(0)
@@ -684,20 +711,18 @@ class UNet(DDPM):
             for _ in range(b0):
                 torch.manual_seed(seed)
                 tens.append(torch.randn(img_shape, device=x0.device))
-                seed+=1
+                seed += 1
             noise = torch.cat(tens)
             del tens
         if mask is not None:
             noise = noise*mask
         return (extract_into_tensor(sqrt_alphas_cumprod, t, x0.shape) * x0 +
-                extract_into_tensor(sqrt_one_minus_alphas_cumprod.to(self.cdevice), t, x0.shape) * noise)
+                extract_into_tensor(sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise)
 
     @torch.no_grad()
     def decode(self, x_latent, cond, t_start, unconditional_guidance_scale=1.0, unconditional_conditioning=None,
-               mask = None,use_original_steps=False):
-
-        
-        if(self.turbo):
+               mask=None, img_original=None, use_original_steps=False, img_callback=None, seed=None):
+        if (self.turbo):
             self.model1.to(self.cdevice)
             self.model2.to(self.cdevice)
 
@@ -710,22 +735,21 @@ class UNet(DDPM):
 
         iterator = tqdm(time_range, desc='Decoding image', total=total_steps)
         x_dec = x_latent
-        # x0 = x_latent
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
             ts = torch.full((x_latent.shape[0],), step, device=x_latent.device, dtype=torch.long)
-            
 
-            # if mask is not None:
-            #     x_dec = x0 * mask + (1. - mask) * x_dec
+            x_dec, noise = self.p_sample_ddim(x_dec, cond, ts, index=index, use_original_steps=use_original_steps,
+                                              unconditional_guidance_scale=unconditional_guidance_scale,
+                                              unconditional_conditioning=unconditional_conditioning)
+            if mask is not None and img_original is not None:
+                img_orig = self.q_sample(img_original, ts, seed=seed, index=index, use_original_steps=use_original_steps)
+                x_dec = img_orig * mask + (1. - mask) * x_dec
 
-            x_dec = self.p_sample_ddim(x_dec, cond, ts, index=index, use_original_steps=use_original_steps,
-                                          unconditional_guidance_scale=unconditional_guidance_scale,
-                                          unconditional_conditioning=unconditional_conditioning)
-        # if mask is not None:
-        #     return x0 * mask + (1. - mask) * x_dec
-        
-        if(self.turbo):
+            if img_callback is not None:
+                img_callback(x_dec, i)
+
+        if (self.turbo):
             self.model1.to("cpu")
             self.model2.to("cpu")
 
@@ -771,4 +795,4 @@ class UNet(DDPM):
         if noise_dropout > 0.:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-        return x_prev
+        return x_prev, noise

@@ -52,6 +52,36 @@ def load_img(path, h0, w0):
     image = torch.from_numpy(image)
     return 2.0 * image - 1.0
 
+def preprocess_mask_latent(mask):
+    mask = mask.convert("L")
+    w, h = mask.size
+    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+    mask = mask.resize((w // 8, h // 8), resample=Image.NEAREST)
+    mask = np.array(mask).astype(np.float32) / 255.0
+    mask = np.tile(mask, (4, 1, 1))
+    mask = mask[None].transpose(0, 1, 2, 3)
+    mask = 1 - mask  # repaint white, keep black
+    mask = torch.from_numpy(mask)
+    return mask
+
+def preprocess_mask(mask):
+    mask = mask.convert("L")
+    mask = np.array(mask).astype(np.float32) / 255.0
+    mask = np.tile(mask, (3, 1, 1))
+    mask = mask[None].transpose(0, 1, 2, 3)
+    mask = 1 - mask  # repaint white, keep black
+    mask = torch.from_numpy(mask)
+    return mask
+
+def img_callback(x0, i):
+    modelFS.to('cuda')
+    x_samples_ddim = modelFS.decode_first_stage(x0[0].unsqueeze(0))
+    x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+    x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
+    Image.fromarray(x_sample.astype(np.uint8)).save(
+        os.path.join(sample_path + "/samples", "seed_" + str(opt.seed) + "_index" + str(i) + "_" + f"{base_count:05}.{opt.format}")
+    )
+    modelFS.to('cpu')
 
 config = "optimizedSD/v1-inference.yaml"
 ckpt = "models/ldm/stable-diffusion-v1/model.ckpt"
@@ -167,6 +197,12 @@ parser.add_argument(
     choices=["jpg", "png"],
     default="png",
 )
+parser.add_argument(
+    "--mask_prompt",
+    type=str,
+    help="mask to prompt with, must specify image prompt",
+    default=None
+)
 opt = parser.parse_args()
 
 tic = time.time()
@@ -245,6 +281,30 @@ modelFS.to(opt.device)
 init_image = repeat(init_image, "1 ... -> b ...", b=batch_size)
 init_latent = modelFS.get_first_stage_encoding(modelFS.encode_first_stage(init_image))  # move to latent space
 
+# by default not do inpaint
+mask_latent = None
+
+# inpaint
+if opt.mask_prompt:
+    seed = opt.seed
+    print("Using mask image: " + opt.mask_prompt)
+    mask_latent = preprocess_mask_latent(Image.open(opt.mask_prompt))
+    mask_latent = repeat(mask_latent[0, :, :, :], 'c h w -> b c h w', b=opt.n_samples).to(opt.device)
+
+    b0, b1, b2, b3 = init_latent.shape
+    img_shape = (1, b1, b2, b3)
+    tens = []
+    print("seeds used in mask randn = ", [seed+s for s in range(b0)])
+    for _ in range(b0):
+        torch.manual_seed(seed)
+        tens.append(torch.randn(img_shape, device=init_latent.device))
+        seed += 1
+    noise = torch.cat(tens)
+    del tens
+
+    init_latents_noised = init_latent * (mask_latent) + noise * (1 - mask_latent)
+    init_latent = init_latent * (1 - opt.strength) + init_latents_noised * opt.strength
+
 if opt.device != "cpu":
     mem = torch.cuda.memory_allocated() / 1e6
     modelFS.to("cpu")
@@ -271,6 +331,7 @@ with torch.no_grad():
 
             sample_path = os.path.join(outpath, "_".join(re.split(":| ", prompts[0])))[:150]
             os.makedirs(sample_path, exist_ok=True)
+            os.makedirs(sample_path + "/samples", exist_ok=True)
             base_count = len(os.listdir(sample_path))
 
             with precision_scope("cuda"):
@@ -315,6 +376,10 @@ with torch.no_grad():
                     t_enc,
                     unconditional_guidance_scale=opt.scale,
                     unconditional_conditioning=uc,
+                    img_callback=img_callback,
+                    mask=mask_latent,
+                    img_original=init_latent,
+                    seed=opt.seed
                 )
 
                 modelFS.to(opt.device)

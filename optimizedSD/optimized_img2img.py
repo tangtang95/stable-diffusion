@@ -1,22 +1,24 @@
-import argparse, os, re
-import torch
-import numpy as np
-from random import randint
-from omegaconf import OmegaConf
-from PIL import Image
-from tqdm import tqdm, trange
-from itertools import islice
-from einops import rearrange
-from torchvision.utils import make_grid
+import argparse
+import os
+import re
 import time
+from contextlib import nullcontext
+from itertools import islice
+from random import randint
+
+import numpy as np
+import torch
+from einops import rearrange, repeat
+from omegaconf import OmegaConf
+from optimUtils import logger, split_weighted_subprompts
+from PIL import Image
 from pytorch_lightning import seed_everything
 from torch import autocast
-from contextlib import contextmanager, nullcontext
-from einops import rearrange, repeat
-from ldm.util import instantiate_from_config
-from optimUtils import split_weighted_subprompts, logger
+from tqdm import tqdm, trange
 from transformers import logging
-import pandas as pd
+
+from ldm.util import instantiate_from_config
+
 logging.set_verbosity_error()
 
 
@@ -52,6 +54,7 @@ def load_img(path, h0, w0):
     image = torch.from_numpy(image)
     return 2.0 * image - 1.0
 
+
 def preprocess_mask_latent(mask):
     mask = mask.convert("L")
     w, h = mask.size
@@ -64,6 +67,7 @@ def preprocess_mask_latent(mask):
     mask = torch.from_numpy(mask)
     return mask
 
+
 def preprocess_mask(mask):
     mask = mask.convert("L")
     mask = np.array(mask).astype(np.float32) / 255.0
@@ -73,15 +77,25 @@ def preprocess_mask(mask):
     mask = torch.from_numpy(mask)
     return mask
 
+
 def img_callback(x0, i):
-    modelFS.to('cuda')
+    modelFS.to("cuda")
     x_samples_ddim = modelFS.decode_first_stage(x0[0].unsqueeze(0))
     x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
     x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
     Image.fromarray(x_sample.astype(np.uint8)).save(
-        os.path.join(sample_path + "/samples", "seed_" + str(opt.seed) + "_index" + str(i) + "_" + f"{base_count:05}.{opt.format}")
+        os.path.join(
+            sample_path + "/samples",
+            "seed_"
+            + str(opt.seed)
+            + "_index"
+            + str(i)
+            + "_"
+            + f"{base_count:05}.{opt.format}",
+        )
     )
-    modelFS.to('cpu')
+    modelFS.to("cpu")
+
 
 config = "optimizedSD/v1-inference.yaml"
 ckpt = "models/ldm/stable-diffusion-v1/model.ckpt"
@@ -89,9 +103,19 @@ ckpt = "models/ldm/stable-diffusion-v1/model.ckpt"
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--prompt", type=str, nargs="?", default="a painting of a virus monster playing guitar", help="the prompt to render"
+    "--prompt",
+    type=str,
+    nargs="?",
+    default="a painting of a virus monster playing guitar",
+    help="the prompt to render",
 )
-parser.add_argument("--outdir", type=str, nargs="?", help="dir to write results to", default="outputs/img2img-samples")
+parser.add_argument(
+    "--outdir",
+    type=str,
+    nargs="?",
+    help="dir to write results to",
+    default="outputs/img2img-samples",
+)
 parser.add_argument("--init-img", type=str, nargs="?", help="path to the input image")
 
 parser.add_argument(
@@ -188,7 +212,11 @@ parser.add_argument(
     help="Reduces inference time on the expense of 1GB VRAM",
 )
 parser.add_argument(
-    "--precision", type=str, help="evaluate at this precision", choices=["full", "autocast"], default="autocast"
+    "--precision",
+    type=str,
+    help="evaluate at this precision",
+    choices=["full", "autocast"],
+    default="autocast",
 )
 parser.add_argument(
     "--format",
@@ -201,7 +229,7 @@ parser.add_argument(
     "--mask_prompt",
     type=str,
     help="mask to prompt with, must specify image prompt",
-    default=None
+    default=None,
 )
 opt = parser.parse_args()
 
@@ -210,12 +238,12 @@ os.makedirs(opt.outdir, exist_ok=True)
 outpath = opt.outdir
 grid_count = len(os.listdir(outpath)) - 1
 
-if opt.seed == None:
+if opt.seed is None:
     opt.seed = randint(0, 1000000)
 seed_everything(opt.seed)
 
 # Logging
-logger(vars(opt), log_csv = "logs/img2img_logs.csv")
+logger(vars(opt), log_csv="logs/img2img_logs.csv")
 
 sd = load_model_from_config(f"{ckpt}")
 li, lo = [], []
@@ -279,7 +307,9 @@ else:
 modelFS.to(opt.device)
 
 init_image = repeat(init_image, "1 ... -> b ...", b=batch_size)
-init_latent = modelFS.get_first_stage_encoding(modelFS.encode_first_stage(init_image))  # move to latent space
+init_latent = modelFS.get_first_stage_encoding(
+    modelFS.encode_first_stage(init_image)
+)  # move to latent space
 
 # by default not do inpaint
 mask_latent = None
@@ -289,12 +319,14 @@ if opt.mask_prompt:
     seed = opt.seed
     print("Using mask image: " + opt.mask_prompt)
     mask_latent = preprocess_mask_latent(Image.open(opt.mask_prompt))
-    mask_latent = repeat(mask_latent[0, :, :, :], 'c h w -> b c h w', b=opt.n_samples).to(opt.device)
+    mask_latent = repeat(
+        mask_latent[0, :, :, :], "c h w -> b c h w", b=opt.n_samples
+    ).to(opt.device)
 
     b0, b1, b2, b3 = init_latent.shape
     img_shape = (1, b1, b2, b3)
     tens = []
-    print("seeds used in mask randn = ", [seed+s for s in range(b0)])
+    print("seeds used in mask randn = ", [seed + s for s in range(b0)])
     for _ in range(b0):
         torch.manual_seed(seed)
         tens.append(torch.randn(img_shape, device=init_latent.device))
@@ -329,7 +361,9 @@ with torch.no_grad():
     for n in trange(opt.n_iter, desc="Sampling"):
         for prompts in tqdm(data, desc="data"):
 
-            sample_path = os.path.join(outpath, "_".join(re.split(":| ", prompts[0])))[:150]
+            sample_path = os.path.join(outpath, "_".join(re.split(":| ", prompts[0])))[
+                :150
+            ]
             os.makedirs(sample_path, exist_ok=True)
             os.makedirs(sample_path + "/samples", exist_ok=True)
             base_count = len(os.listdir(sample_path))
@@ -351,7 +385,11 @@ with torch.no_grad():
                         weight = weights[i]
                         # if not skip_normalize:
                         weight = weight / totalWeight
-                        c = torch.add(c, modelCS.get_learned_conditioning(subprompts[i]), alpha=weight)
+                        c = torch.add(
+                            c,
+                            modelCS.get_learned_conditioning(subprompts[i]),
+                            alpha=weight,
+                        )
                 else:
                     c = modelCS.get_learned_conditioning(prompts)
 
@@ -379,18 +417,30 @@ with torch.no_grad():
                     img_callback=img_callback,
                     mask=mask_latent,
                     img_original=init_latent,
-                    seed=opt.seed
+                    seed=opt.seed,
                 )
 
                 modelFS.to(opt.device)
                 print("saving images")
                 for i in range(batch_size):
 
-                    x_samples_ddim = modelFS.decode_first_stage(samples_ddim[i].unsqueeze(0))
-                    x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                    x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
+                    x_samples_ddim = modelFS.decode_first_stage(
+                        samples_ddim[i].unsqueeze(0)
+                    )
+                    x_sample = torch.clamp(
+                        (x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0
+                    )
+                    x_sample = 255.0 * rearrange(
+                        x_sample[0].cpu().numpy(), "c h w -> h w c"
+                    )
                     Image.fromarray(x_sample.astype(np.uint8)).save(
-                        os.path.join(sample_path, "seed_" + str(opt.seed) + "_" + f"{base_count:05}.{opt.format}")
+                        os.path.join(
+                            sample_path,
+                            "seed_"
+                            + str(opt.seed)
+                            + "_"
+                            + f"{base_count:05}.{opt.format}",
+                        )
                     )
                     seeds += str(opt.seed) + ","
                     opt.seed += 1

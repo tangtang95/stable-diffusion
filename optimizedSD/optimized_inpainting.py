@@ -1,22 +1,26 @@
-import argparse, os, re
-import torch
-import numpy as np
-from random import randint
-from omegaconf import OmegaConf
-from PIL import Image
-from tqdm import tqdm, trange
-from itertools import islice
-from einops import rearrange, repeat
-from torchvision.utils import make_grid
+import argparse
+import os
+import re
 import time
+from contextlib import nullcontext
+from itertools import islice
+from random import randint
+
+import numpy as np
+import torch
+from einops import rearrange, repeat
+from omegaconf import OmegaConf
+from optimUtils import logger, split_weighted_subprompts
+from PIL import Image
 from pytorch_lightning import seed_everything
 from torch import autocast
-from contextlib import contextmanager, nullcontext
-from ldm.util import instantiate_from_config
-from optimUtils import split_weighted_subprompts, logger
+from tqdm import tqdm, trange
 from transformers import logging
-import pandas as pd
+
+from ldm.util import instantiate_from_config
+
 logging.set_verbosity_error()
+
 
 def preprocess_image(image):
     w, h = image.size
@@ -26,6 +30,7 @@ def preprocess_image(image):
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
     return 2.0 * image - 1.0
+
 
 def preprocess_mask(mask):
     mask = mask.convert("L")
@@ -39,15 +44,25 @@ def preprocess_mask(mask):
     mask = torch.from_numpy(mask)
     return mask
 
+
 def img_callback(x0, i):
-    modelFS.to('cuda')
+    modelFS.to("cuda")
     x_samples_ddim = modelFS.decode_first_stage(x0[0].unsqueeze(0))
     x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
     x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
     Image.fromarray(x_sample.astype(np.uint8)).save(
-        os.path.join(sample_path + "/samples", "seed_" + str(opt.seed) + "_index" + str(i) + "_" + f"{base_count:05}.{opt.format}")
+        os.path.join(
+            sample_path + "/samples",
+            "seed_"
+            + str(opt.seed)
+            + "_index"
+            + str(i)
+            + "_"
+            + f"{base_count:05}.{opt.format}",
+        )
     )
-    modelFS.to('cpu')
+    modelFS.to("cpu")
+
 
 def chunk(it, size):
     it = iter(it)
@@ -69,9 +84,19 @@ ckpt = "models/ldm/stable-diffusion-v1/model.ckpt"
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--prompt", type=str, nargs="?", default="a painting of a virus monster playing guitar", help="the prompt to render"
+    "--prompt",
+    type=str,
+    nargs="?",
+    default="a painting of a virus monster playing guitar",
+    help="the prompt to render",
 )
-parser.add_argument("--outdir", type=str, nargs="?", help="dir to write results to", default="outputs/txt2img-samples")
+parser.add_argument(
+    "--outdir",
+    type=str,
+    nargs="?",
+    help="dir to write results to",
+    default="outputs/txt2img-samples",
+)
 parser.add_argument(
     "--skip_grid",
     action="store_true",
@@ -177,11 +202,11 @@ parser.add_argument(
     help="Reduces inference time on the expense of 1GB VRAM",
 )
 parser.add_argument(
-    "--precision", 
+    "--precision",
     type=str,
     help="evaluate at this precision",
     choices=["full", "autocast"],
-    default="autocast"
+    default="autocast",
 )
 parser.add_argument(
     "--format",
@@ -194,13 +219,13 @@ parser.add_argument(
     "--image_prompt",
     type=str,
     help="image to prompt with, must specify a mask",
-    default=None
+    default=None,
 )
 parser.add_argument(
     "--mask_prompt",
     type=str,
     help="mask to prompt with, must specify image prompt",
-    default=None
+    default=None,
 )
 opt = parser.parse_args()
 
@@ -260,7 +285,9 @@ if opt.device != "cpu" and opt.precision == "autocast":
 
 start_code = None
 if opt.fixed_code:
-    start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=opt.device)
+    start_code = torch.randn(
+        [opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=opt.device
+    )
 
 
 batch_size = opt.n_samples
@@ -290,11 +317,13 @@ if image_prompt and mask_prompt:
     print("Using image as x0: " + image_prompt)
     print("Using mask image: " + mask_prompt)
     image_prompt_input = preprocess_image(Image.open(image_prompt))
-    image_prompt_input = repeat(image_prompt_input[0, :, :, :], 'c h w -> b c h w', b=opt.n_samples).to(opt.device)
+    image_prompt_input = repeat(
+        image_prompt_input[0, :, :, :], "c h w -> b c h w", b=opt.n_samples
+    ).to(opt.device)
     encoder_posterior = modelFS.encode_first_stage(image_prompt_input)
     x0 = modelFS.get_first_stage_encoding(encoder_posterior).detach().to(opt.device)
     mask = preprocess_mask(Image.open(mask_prompt))
-    mask = repeat(mask[0, :, :, :], 'c h w -> b c h w', b=opt.n_samples).to(opt.device)
+    mask = repeat(mask[0, :, :, :], "c h w -> b c h w", b=opt.n_samples).to(opt.device)
     if opt.device != "cpu":
         modelFS.to("cpu")
 
@@ -310,7 +339,9 @@ with torch.no_grad():
     for n in trange(opt.n_iter, desc="Sampling"):
         for prompts in tqdm(data, desc="data"):
 
-            sample_path = os.path.join(outpath, "_".join(re.split(":| ", prompts[0])))[:150]
+            sample_path = os.path.join(outpath, "_".join(re.split(":| ", prompts[0])))[
+                :150
+            ]
             os.makedirs(sample_path, exist_ok=True)
             os.makedirs(sample_path + "/samples", exist_ok=True)
             base_count = len(os.listdir(sample_path))
@@ -332,7 +363,11 @@ with torch.no_grad():
                         weight = weights[i]
                         # if not skip_normalize:
                         weight = weight / totalWeight
-                        c = torch.add(c, modelCS.get_learned_conditioning(subprompts[i]), alpha=weight)
+                        c = torch.add(
+                            c,
+                            modelCS.get_learned_conditioning(subprompts[i]),
+                            alpha=weight,
+                        )
                 else:
                     c = modelCS.get_learned_conditioning(prompts)
 
@@ -358,7 +393,7 @@ with torch.no_grad():
                     x_T=start_code,
                     mask=mask,
                     x0=x0,
-                    img_callback=img_callback
+                    img_callback=img_callback,
                 )
 
                 modelFS.to(opt.device)
@@ -367,11 +402,23 @@ with torch.no_grad():
                 print("saving images")
                 for i in range(batch_size):
 
-                    x_samples_ddim = modelFS.decode_first_stage(samples_ddim[i].unsqueeze(0))
-                    x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                    x_sample = 255.0 * rearrange(x_sample[0].cpu().numpy(), "c h w -> h w c")
+                    x_samples_ddim = modelFS.decode_first_stage(
+                        samples_ddim[i].unsqueeze(0)
+                    )
+                    x_sample = torch.clamp(
+                        (x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0
+                    )
+                    x_sample = 255.0 * rearrange(
+                        x_sample[0].cpu().numpy(), "c h w -> h w c"
+                    )
                     Image.fromarray(x_sample.astype(np.uint8)).save(
-                        os.path.join(sample_path, "seed_" + str(opt.seed) + "_" + f"{base_count:05}.{opt.format}")
+                        os.path.join(
+                            sample_path,
+                            "seed_"
+                            + str(opt.seed)
+                            + "_"
+                            + f"{base_count:05}.{opt.format}",
+                        )
                     )
                     seeds += str(opt.seed) + ","
                     opt.seed += 1
